@@ -55,6 +55,11 @@ jobs:
       - name: find the tested commit and its versions
         id: v
         run: |
+          # Already released (e.g. the bootstrap commit that got the initial v0.1.0 tag): nothing to do.
+          if git tag --points-at HEAD | grep -qE '^(v|chart-v)[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::HEAD ${GITHUB_SHA:0:7} is already tagged as a release ($(git tag --points-at HEAD | xargs)); nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           PARENTS=$(git rev-list --parents -n1 HEAD | wc -w)
           if [ "$PARENTS" -ne 3 ]; then
             echo "::error::main must only receive merge commits of release/* or hotfix/* PRs (HEAD ${GITHUB_SHA:0:7} is not a merge). Use 'Create a merge commit', not squash or rebase."
@@ -81,13 +86,14 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4.4.1
       - uses: docker/login-action@v4.8.0
+        if: steps.v.outputs.skip != 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: promote the tested image (re-tag, no rebuild)
-        if: steps.v.outputs.app_changed == 'true'
+        if: steps.v.outputs.skip != 'true' && steps.v.outputs.app_changed == 'true'
         env:
           VERSION: ${{ steps.v.outputs.version }}
           RC: ${{ steps.v.outputs.rc_version }}
@@ -108,11 +114,11 @@ jobs:
           echo "\`$IMAGE:$VERSION\` = \`$FROM\` (digest $A)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: azure/setup-helm@v5.1.0
-        if: steps.v.outputs.chart_changed == 'true'
+        if: steps.v.outputs.skip != 'true' && steps.v.outputs.chart_changed == 'true'
         with:
           version: ${{ env.HELM_VERSION }}
       - name: publish the final chart (same templates as the tested rc)
-        if: steps.v.outputs.chart_changed == 'true'
+        if: steps.v.outputs.skip != 'true' && steps.v.outputs.chart_changed == 'true'
         env:
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -133,6 +139,7 @@ jobs:
           exit 1
 
       - name: tag and GitHub Release
+        if: steps.v.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
@@ -161,6 +168,7 @@ jobs:
           fi
 
       - name: back-merge PR main -> develop
+        if: steps.v.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
