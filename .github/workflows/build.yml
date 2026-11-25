@@ -1,0 +1,173 @@
+# Build: compute app + chart versions for this branch, then publish whatever is new.
+#
+#   develop       -> app X.Y.Z-dev.N   chart A.B.C-dev.M
+#   release/*     -> app X.Y.Z-rc.N    chart A.B.C-rc.M     (N counted from the branch point on develop)
+#   hotfix/*      -> app X.Y.Z-rc.N    chart A.B.C-rc.M     (N counted from main)
+#   pull_request  -> versions computed, image built (not pushed), chart linted only
+#
+# App version = Conventional Commits outside charts/, tag vX.Y.Z. Chart version = commits touching
+# the chart, tag chart-vA.B.C. If nothing changed since the last release, that release's version is
+# reused and nothing is rebuilt. Every pushed image is also tagged with the commit SHA.
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name (image and chart name).
+        type: string
+        required: true
+      chart_path:
+        description: Chart folder (default charts/<service>).
+        type: string
+        default: ''
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        default: Dockerfile
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+      chart_version:
+        value: ${{ jobs.version.outputs.chart_version }}
+      app_changed:
+        value: ${{ jobs.version.outputs.app_changed }}
+      chart_changed:
+        value: ${{ jobs.version.outputs.chart_changed }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Scripts come from this repo at the same major version the caller pinned.
+  PLATFORM_REPO: bhumi46/platform-workflows
+  PLATFORM_REF: v1
+  HELM_VERSION: v4.1.0
+  IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.service }}
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+  CHART_PATH: ${{ inputs.chart_path != '' && inputs.chart_path || format('charts/{0}', inputs.service) }}
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      chart_version: ${{ steps.v.outputs.chart_version }}
+      app_changed: ${{ steps.v.outputs.app_changed }}
+      chart_changed: ${{ steps.v.outputs.chart_changed }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0   # full history and tags for the version calculation
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ env.PLATFORM_REF }}
+          path: .platform
+      - name: compute versions
+        id: v
+        env:
+          REF_NAME: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+        run: |
+          git fetch -q origin develop main 2>/dev/null || true
+          case "$REF_NAME" in
+            release/*) STAGE=rc;  SINCE=$(git merge-base HEAD origin/develop 2>/dev/null || true);;
+            hotfix/*)  STAGE=rc;  SINCE=$(git merge-base HEAD origin/main 2>/dev/null || true);;
+            *)         STAGE=dev; SINCE="";;
+          esac
+          SN=.platform/scripts/semver-next
+          APP=$($SN --prefix v --exclude charts/ --stage "$STAGE" ${SINCE:+--since "$SINCE"})
+          CHART=$($SN --prefix chart-v --include "$CHART_PATH" --stage "$STAGE" ${SINCE:+--since "$SINCE"})
+          get() { sed -n "s/^$1=//p" <<<"$2"; }
+          {
+            echo "version=$(get version "$APP")";        echo "app_changed=$(get changed "$APP")"
+            echo "chart_version=$(get version "$CHART")"; echo "chart_changed=$(get changed "$CHART")"
+          } | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### Versions for \`$REF_NAME\` ($STAGE)"
+            echo "| | version | bump since last release | last release |"
+            echo "|---|---|---|---|"
+            echo "| app | \`$(get version "$APP")\` | $(get bump "$APP") | $(get last_tag "$APP") |"
+            echo "| chart | \`$(get version "$CHART")\` | $(get bump "$CHART") | $(get last_tag "$CHART") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-qemu-action@v4.4.0
+        if: github.event_name == 'push'
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: skip if this version is already published
+        id: exists
+        if: github.event_name == 'push'
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "::notice::$IMAGE:$VERSION already exists (no app change since it was built); not rebuilding."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/build-push-action@v7.4.0
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          # amd64 for CI/cloud, arm64 for kind on Apple Silicon. PRs: amd64 build check only.
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+  chart:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      CHART_VERSION: ${{ needs.version.outputs.chart_version }}
+      APP_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: azure/setup-helm@v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: lint
+        run: |
+          helm lint "$CHART_PATH" --strict
+          helm template x "$CHART_PATH" --set image.tag=test > /dev/null
+      - name: publish chart if this version is new
+        if: github.event_name == 'push'
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME: ${{ inputs.service }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          if helm show chart "$CHART_REPO/$NAME" --version "$CHART_VERSION" >/dev/null 2>&1; then
+            echo "::notice::chart $NAME $CHART_VERSION already published (no chart change since); not republishing."
+            exit 0
+          fi
+          # Version and appVersion come from the lifecycle, not from Chart.yaml.
+          helm package "$CHART_PATH" --version "$CHART_VERSION" --app-version "$APP_VERSION" --destination dist
+          # GHCR sometimes answers "Tag ... not found" right after creating a new package; retry.
+          for attempt in 1 2 3 4; do
+            helm push "dist/$NAME-$CHART_VERSION.tgz" "$CHART_REPO" && exit 0
+            echo "helm push failed, retrying ($attempt)"; sleep $((attempt * 5))
+          done
+          exit 1

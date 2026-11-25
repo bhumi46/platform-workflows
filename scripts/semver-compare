@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# semver-compare A B  -> prints -1, 0 or 1 (A < B, A = B, A > B) following SemVer 2.0.0 precedence:
+#   1.0.0-dev.2 < 1.0.0-dev.10 < 1.0.0-rc.1 < 1.0.0 < 1.0.1
+# Pre-release identifiers: numeric ones compare numerically and rank below alphanumeric ones;
+# a shorter list of identifiers ranks lower when all preceding ones are equal. Build metadata
+# (+...) is ignored. Exit 2 if an argument is not a valid version.
+set -euo pipefail
+
+RE='^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z.-]+))?(\+[0-9A-Za-z.-]+)?$'
+parse() {
+  [[ $1 =~ $RE ]] || { echo "not a semantic version: '$1'" >&2; exit 2; }
+}
+cmp_num() { if (( 10#$1 < 10#$2 )); then echo -1; elif (( 10#$1 > 10#$2 )); then echo 1; else echo 0; fi; }
+
+parse "$1"; A=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"); AP=${BASH_REMATCH[5]}
+parse "$2"; B=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"); BP=${BASH_REMATCH[5]}
+
+for i in 0 1 2; do
+  c=$(cmp_num "${A[$i]}" "${B[$i]}"); [ "$c" != 0 ] && { echo "$c"; exit 0; }
+done
+# A version without a pre-release ranks higher than one with.
+if [ -z "$AP" ] && [ -z "$BP" ]; then echo 0; exit 0; fi
+if [ -z "$AP" ]; then echo 1; exit 0; fi
+if [ -z "$BP" ]; then echo -1; exit 0; fi
+
+IFS=. read -r -a X <<<"$AP"; IFS=. read -r -a Y <<<"$BP"
+n=${#X[@]}; (( ${#Y[@]} > n )) && n=${#Y[@]}
+for ((i = 0; i < n; i++)); do
+  if (( i >= ${#X[@]} )); then echo -1; exit 0; fi
+  if (( i >= ${#Y[@]} )); then echo 1; exit 0; fi
+  x=${X[$i]} y=${Y[$i]}
+  if [[ $x =~ ^[0-9]+$ && $y =~ ^[0-9]+$ ]]; then
+    c=$(cmp_num "$x" "$y")
+  elif [[ $x =~ ^[0-9]+$ ]]; then c=-1
+  elif [[ $y =~ ^[0-9]+$ ]]; then c=1
+  elif [[ $x < $y ]]; then c=-1
+  elif [[ $x > $y ]]; then c=1
+  else c=0; fi
+  [ "$c" != 0 ] && { echo "$c"; exit 0; }
+done
+echo 0

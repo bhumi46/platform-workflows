@@ -1,0 +1,25 @@
+# Tests for this repo itself: version scripts (bats), shell (shellcheck), workflows (actionlint).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: bats
+        run: |
+          docker run --rm -v "$PWD:/code" -w /code --entrypoint sh \
+            bats/bats:1.14.0@sha256:5322b877351fda0cc435de8c6116de7d0a2ec79d7c680132a0ef329a633bc66f \
+            -c 'apk add --no-cache -q git >/dev/null && bats tests'
+      - name: shellcheck
+        run: docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d scripts/*
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/w" -w /w rhysd/actionlint:1.7.7 -ignore SC2016

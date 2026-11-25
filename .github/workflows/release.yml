@@ -1,0 +1,174 @@
+# Release: runs on main after a release/* or hotfix/* PR is merged (the maintainer's merge is the
+# "tested and verified" sign-off). Nothing is rebuilt:
+#   1. the merged branch head is the commit QA tested; its rc image is re-tagged X.Y.Z (same digest)
+#   2. if the chart changed, the same templates are packaged as the final chart version
+#   3. tags vX.Y.Z / chart-vA.B.C on the tested commit + a GitHub Release with generated notes
+#   4. a back-merge PR main -> develop
+# Outputs the final versions so the caller can deploy them (e.g. to staging, usually mode approval).
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      chart_path:
+        type: string
+        default: ''
+    outputs:
+      version:
+        value: ${{ jobs.release.outputs.version }}
+      chart_version:
+        value: ${{ jobs.release.outputs.chart_version }}
+
+permissions:
+  contents: write        # tags + GitHub Release
+  packages: write        # re-tag image, push chart
+  pull-requests: write   # back-merge PR
+
+env:
+  PLATFORM_REPO: bhumi46/platform-workflows
+  PLATFORM_REF: v1
+  HELM_VERSION: v4.1.0
+  IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.service }}
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+  CHART_PATH: ${{ inputs.chart_path != '' && inputs.chart_path || format('charts/{0}', inputs.service) }}
+  NAME: ${{ inputs.service }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      chart_version: ${{ steps.v.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ env.PLATFORM_REF }}
+          path: .platform
+
+      - name: find the tested commit and its versions
+        id: v
+        run: |
+          PARENTS=$(git rev-list --parents -n1 HEAD | wc -w)
+          if [ "$PARENTS" -ne 3 ]; then
+            echo "::error::main must only receive merge commits of release/* or hotfix/* PRs (HEAD ${GITHUB_SHA:0:7} is not a merge). Use 'Create a merge commit', not squash or rebase."
+            exit 1
+          fi
+          SRC=$(git rev-parse HEAD^2)
+          SUBJECT=$(git log -1 --format=%s HEAD)
+          BRANCH=$(sed -nE 's#.*from [^/ ]+/((release|hotfix)/[^ ]+).*#\1#p' <<<"$SUBJECT")
+          case "$BRANCH" in
+            release/*) SINCE=$(git merge-base "$SRC" origin/develop);;
+            hotfix/*)  SINCE=$(git merge-base "$SRC" HEAD^1);;
+            *) echo "::error::merge commit '$SUBJECT' is not from a release/* or hotfix/* branch."; exit 1;;
+          esac
+          SN=.platform/scripts/semver-next
+          get() { sed -n "s/^$1=//p" <<<"$2"; }
+          APP_F=$($SN --ref "$SRC" --prefix v --exclude charts/ --stage final)
+          APP_RC=$($SN --ref "$SRC" --prefix v --exclude charts/ --stage rc --since "$SINCE")
+          CH_F=$($SN --ref "$SRC" --prefix chart-v --include "$CHART_PATH" --stage final)
+          {
+            echo "src=$SRC"; echo "branch=$BRANCH"
+            echo "version=$(get version "$APP_F")"; echo "app_changed=$(get changed "$APP_F")"; echo "rc_version=$(get version "$APP_RC")"
+            echo "chart_version=$(get version "$CH_F")"; echo "chart_changed=$(get changed "$CH_F")"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: promote the tested image (re-tag, no rebuild)
+        if: steps.v.outputs.app_changed == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          RC: ${{ steps.v.outputs.rc_version }}
+          SRC: ${{ steps.v.outputs.src }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "::notice::$IMAGE:$VERSION already exists."; exit 0
+          fi
+          FROM="$IMAGE:$RC"
+          docker buildx imagetools inspect "$FROM" >/dev/null 2>&1 || FROM="$IMAGE:$SRC"
+          docker buildx imagetools inspect "$FROM" >/dev/null 2>&1 || {
+            echo "::error::no tested image for ${SRC:0:7} ($IMAGE:$RC or :$SRC). Was the release branch built?"; exit 1; }
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "$FROM"
+          A=$(docker buildx imagetools inspect "$FROM" --format '{{json .Manifest.Digest}}')
+          B=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}')
+          [ "$A" = "$B" ] || { echo "::error::digest mismatch after re-tag ($A vs $B)"; exit 1; }
+          echo "### Released image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$IMAGE:$VERSION\` = \`$FROM\` (digest $A)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: azure/setup-helm@v5.1.0
+        if: steps.v.outputs.chart_changed == 'true'
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: publish the final chart (same templates as the tested rc)
+        if: steps.v.outputs.chart_changed == 'true'
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHART_VERSION: ${{ steps.v.outputs.chart_version }}
+          VERSION: ${{ steps.v.outputs.version }}
+          SRC: ${{ steps.v.outputs.src }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          if helm show chart "$CHART_REPO/$NAME" --version "$CHART_VERSION" >/dev/null 2>&1; then
+            echo "::notice::chart $NAME $CHART_VERSION already published."; exit 0
+          fi
+          git worktree add -q /tmp/src "$SRC"
+          helm package "/tmp/src/$CHART_PATH" --version "$CHART_VERSION" --app-version "$VERSION" --destination dist
+          for attempt in 1 2 3 4; do
+            helm push "dist/$NAME-$CHART_VERSION.tgz" "$CHART_REPO" && exit 0
+            echo "helm push failed, retrying ($attempt)"; sleep $((attempt * 5))
+          done
+          exit 1
+
+      - name: tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+          CHART_VERSION: ${{ steps.v.outputs.chart_version }}
+          SRC: ${{ steps.v.outputs.src }}
+          APP_CHANGED: ${{ steps.v.outputs.app_changed }}
+          CHART_CHANGED: ${{ steps.v.outputs.chart_changed }}
+          BRANCH: ${{ steps.v.outputs.branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          TAGS=()
+          if [ "$APP_CHANGED" = true ] && ! git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            git tag -a "v$VERSION" "$SRC" -m "$NAME $VERSION"; TAGS+=("v$VERSION")
+          fi
+          if [ "$CHART_CHANGED" = true ] && ! git rev-parse -q --verify "refs/tags/chart-v$CHART_VERSION" >/dev/null; then
+            git tag -a "chart-v$CHART_VERSION" "$SRC" -m "$NAME chart $CHART_VERSION"; TAGS+=("chart-v$CHART_VERSION")
+          fi
+          if [ ${#TAGS[@]} -eq 0 ]; then echo "::notice::nothing new to release."; exit 0; fi
+          git push origin "${TAGS[@]}"
+          if [ "$APP_CHANGED" = true ]; then
+            NOTES=$(printf '%s\n' "Released from \`$BRANCH\` (tested commit ${SRC:0:7})." "" \
+              "- Image: \`$IMAGE:$VERSION\` (re-tagged, same digest as the tested release candidate)" \
+              "- Chart: \`$CHART_REPO/$NAME\` \`$CHART_VERSION\`")
+            gh release create "v$VERSION" --verify-tag --title "$NAME $VERSION" --notes "$NOTES" --generate-notes
+          fi
+
+      - name: back-merge PR main -> develop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          if [ -n "$(gh pr list --base develop --head main --state open --json number --jq '.[0].number // empty')" ]; then
+            echo "back-merge PR already open"; exit 0
+          fi
+          if git merge-base --is-ancestor HEAD origin/develop; then echo "develop already contains main"; exit 0; fi
+          gh pr create --base develop --head main --title "chore: back-merge $VERSION from main into develop" \
+            --body "Brings the release tags and any release-branch fixes back into \`develop\`. Merge with a **merge commit**." \
+            || echo "::warning::could not open the back-merge PR. Enable 'Allow GitHub Actions to create and approve pull requests' in the repo settings, or open it by hand."

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# semver-next: the next semantic version of an app or chart, from Conventional Commits.
+#
+#   semver-next --prefix v --exclude charts/ --stage dev      # app on develop   -> 0.2.0-dev.3
+#   semver-next --prefix chart-v --include charts/ --stage rc # chart on release -> 0.1.1-rc.1
+#   semver-next --prefix v --exclude charts/ --stage final    # release          -> 0.2.0
+#
+# Rules (https://www.conventionalcommits.org, https://semver.org):
+#   fix:/perf:                           -> patch
+#   feat:                                -> minor
+#   <type>!: or "BREAKING CHANGE:" body  -> major (minor while the version is 0.x)
+#   other types (chore, docs, ci, ...)   -> no bump on their own (patch if a pre-release is needed)
+#   "Release-As: X.Y.Z" footer           -> exactly X.Y.Z (e.g. GA 1.0.0)
+# Base = highest final tag <prefix>X.Y.Z reachable from the ref (none -> next version 0.1.0).
+# Pre-release number N:
+#   dev: commits on the path since the base tag
+#   rc:  commits on the path since the branch point (--since, default merge-base with origin/develop) + 1
+# If nothing on the path changed since the base tag, the base version itself is reused
+# (changed=false): no new artifact is needed.
+#
+# Output: key=value lines (append to $GITHUB_OUTPUT):
+#   version, base, bump, count, last_tag, changed
+set -euo pipefail
+
+PREFIX=v STAGE=final REF=HEAD SINCE="" INCLUDE="" EXCLUDE=""
+usage() { sed -n '2,25p' "$0" >&2; exit 2; }
+while [ $# -gt 0 ]; do
+  case $1 in
+    --prefix) PREFIX=$2; shift 2;;
+    --stage) STAGE=$2; shift 2;;
+    --ref) REF=$2; shift 2;;
+    --since) SINCE=$2; shift 2;;
+    --include) INCLUDE=$2; shift 2;;
+    --exclude) EXCLUDE=$2; shift 2;;
+    -h|--help) usage;;
+    *) echo "unknown argument: $1" >&2; usage;;
+  esac
+done
+case $STAGE in dev|rc|final) ;; *) echo "--stage must be dev, rc or final" >&2; exit 2;; esac
+
+SEMVER='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
+
+# Path filter for git log/rev-list (app = everything except charts/, chart = only charts/<svc>).
+PATHSPEC=(-- .)
+[ -n "$INCLUDE" ] && PATHSPEC=(-- "$INCLUDE")
+[ -n "$EXCLUDE" ] && PATHSPEC=(-- . ":(exclude)$EXCLUDE")
+
+# Highest final tag reachable from REF (pre-release tags are ignored).
+LAST_TAG=$(git tag --merged "$REF" --list "${PREFIX}*" | while IFS= read -r t; do
+  v=${t#"$PREFIX"}; if [[ $v =~ $SEMVER ]]; then echo "$v"; fi; done | sort -V | tail -1)
+[ -n "$LAST_TAG" ] && LAST_TAG=$PREFIX$LAST_TAG
+
+if [ -n "$LAST_TAG" ]; then
+  BASE=${LAST_TAG#"$PREFIX"}; RANGE="$LAST_TAG..$REF"
+else
+  BASE=0.0.0; RANGE=$REF
+fi
+[[ $BASE =~ $SEMVER ]]
+MAJ=${BASH_REMATCH[1]} MIN=${BASH_REMATCH[2]} PAT=${BASH_REMATCH[3]}
+
+# Highest bump requested by the commits on the path since the base tag.
+BUMP=none FORCED=""
+level() { case $1 in none) echo 0;; patch) echo 1;; minor) echo 2;; major) echo 3;; esac; }
+raise() { [ "$(level "$1")" -gt "$(level "$BUMP")" ] && BUMP=$1; return 0; }
+COUNT=0
+while IFS= read -r -d $'\x1e' entry; do
+  entry=${entry#$'\n'}
+  [ -z "$entry" ] && continue
+  COUNT=$((COUNT + 1))
+  subject=${entry%%$'\n'*}
+  if [[ $entry =~ (^|$'\n')Release-As:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+    f=${BASH_REMATCH[2]}
+    if [ -z "$FORCED" ] || [ "$(printf '%s\n%s\n' "$FORCED" "$f" | sort -V | tail -1)" = "$f" ]; then FORCED=$f; fi
+  fi
+  if [[ $subject =~ ^[a-zA-Z]+(\([^\)]*\))?!: ]] || [[ $entry =~ (^|$'\n')BREAKING[\ -]CHANGE: ]]; then
+    raise major
+  elif [[ $subject =~ ^feat(\([^\)]*\))?: ]]; then
+    raise minor
+  elif [[ $subject =~ ^(fix|perf)(\([^\)]*\))?: ]]; then
+    raise patch
+  fi
+done < <(git log --no-merges --format='%B%x1e' "$RANGE" "${PATHSPEC[@]}")
+
+CHANGED=true
+if [ -n "$LAST_TAG" ] && [ "$COUNT" -eq 0 ]; then
+  CHANGED=false
+fi
+
+if [ "$CHANGED" = false ]; then
+  NEXT=$BASE
+elif [ -n "$FORCED" ]; then
+  NEXT=$FORCED
+elif [ -z "$LAST_TAG" ]; then
+  NEXT=0.1.0                                     # first release of a new project
+else
+  EFFECTIVE=$BUMP
+  [ "$EFFECTIVE" = major ] && [ "$MAJ" -eq 0 ] && EFFECTIVE="minor"  # 0.x: breaking -> minor
+  [ "$EFFECTIVE" = none ] && EFFECTIVE="patch"                         # something changed -> at least patch
+  case $EFFECTIVE in
+    major) NEXT="$((MAJ + 1)).0.0";;
+    minor) NEXT="$MAJ.$((MIN + 1)).0";;
+    patch) NEXT="$MAJ.$MIN.$((PAT + 1))";;
+  esac
+fi
+
+VERSION=$NEXT
+if [ "$CHANGED" = true ]; then
+  case $STAGE in
+    dev) VERSION="$NEXT-dev.$COUNT";;
+    rc)
+      if [ -z "$SINCE" ]; then
+        SINCE=$(git merge-base "$REF" origin/develop 2>/dev/null || git merge-base "$REF" develop 2>/dev/null || true)
+      fi
+      if [ -n "$SINCE" ]; then
+        N=$(( $(git rev-list --count --no-merges "$SINCE..$REF" "${PATHSPEC[@]}") + 1 ))
+      else
+        N=1
+      fi
+      VERSION="$NEXT-rc.$N";;
+  esac
+fi
+
+printf 'version=%s\nbase=%s\nbump=%s\ncount=%s\nlast_tag=%s\nchanged=%s\n' \
+  "$VERSION" "$BASE" "$BUMP" "$COUNT" "$LAST_TAG" "$CHANGED"

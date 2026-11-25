@@ -1,0 +1,200 @@
+# Deploy: point an environment at (app version, chart version) in gitops.
+#
+# What an environment runs lives in gitops:
+#   envs/<env>/<svc>/image.yaml   image.tag      = app version   (e.g. 0.2.0-rc.3)
+#   apps/<svc>-<env>.yaml         targetRevision = chart version (e.g. 0.1.1-rc.1)
+#   envs/<env>/<svc>/deploy.yaml  mode: auto | approval
+#
+#   auto      commit both values on gitops main; Argo CD deploys.
+#   approval  keep ONE rolling PR "deploy/<env>/<svc>" pointing at the newest build; merging it deploys.
+#
+# Never goes backwards: skips when this commit is no longer the head of its branch, or when either
+# version would be lower than what the environment runs (use Backstage "Deploy service" with
+# rollback for that).
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      env:
+        description: Target environment (dev, qa, staging, ...).
+        type: string
+        required: true
+      version:
+        description: App version (image tag).
+        type: string
+        required: true
+      chart_version:
+        description: Chart version (Argo CD targetRevision).
+        type: string
+        required: true
+      dir:
+        description: gitops folder with image.yaml/deploy.yaml (default envs/<env>/<service>).
+        type: string
+        default: ''
+      app_file:
+        description: gitops Application file (default apps/<service>-<env>.yaml).
+        type: string
+        default: ''
+    secrets:
+      GITOPS_TOKEN:
+        description: "PAT on the gitops repo: Contents read/write (+ Pull requests read/write for approval mode)."
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.env }}-${{ inputs.service }}
+  cancel-in-progress: false
+
+env:
+  PLATFORM_REPO: bhumi46/platform-workflows
+  PLATFORM_REF: v1
+  GITOPS_REPO: ${{ github.repository_owner }}/gitops
+  SVC: ${{ inputs.service }}
+  ENV_NAME: ${{ inputs.env }}
+  VERSION: ${{ inputs.version }}
+  CHART_VERSION: ${{ inputs.chart_version }}
+  DIR: ${{ inputs.dir != '' && inputs.dir || format('envs/{0}/{1}', inputs.env, inputs.service) }}
+  APP_FILE: ${{ inputs.app_file != '' && inputs.app_file || format('apps/{0}-{1}.yaml', inputs.service, inputs.env) }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: check GITOPS_TOKEN
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          FIX="Set a PAT with Contents (and Pull requests) read/write on $GITOPS_REPO: gh secret set GITOPS_TOKEN -R ${{ github.repository }}"
+          if [ -z "$GITOPS_TOKEN" ]; then
+            echo "::error::GITOPS_TOKEN secret is not set in ${{ github.repository }}. $FIX"; exit 1
+          fi
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GITOPS_TOKEN" "https://api.github.com/repos/$GITOPS_REPO")
+          if [ "$CODE" != 200 ]; then
+            echo "::error::GITOPS_TOKEN was rejected by GitHub (HTTP $CODE): expired, revoked, mistyped or no access to $GITOPS_REPO. $FIX"; exit 1
+          fi
+
+      - name: only deploy the head of the branch
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST=$(gh api "repos/${{ github.repository }}/commits/${{ github.ref_name }}" --jq .sha)
+          if [ "$LATEST" != "${{ github.sha }}" ]; then
+            echo "::notice::${GITHUB_SHA:0:7} is no longer the head of ${{ github.ref_name }} (${LATEST:0:7}); that newer commit's run deploys. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7.0.1
+        if: steps.head.outputs.skip != 'true'
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ env.PLATFORM_REF }}
+          path: .platform
+
+      - uses: actions/checkout@v7.0.1
+        if: steps.head.outputs.skip != 'true'
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: read deploy mode and what runs now
+        id: state
+        if: steps.head.outputs.skip != 'true'
+        working-directory: gitops
+        run: |
+          if [ ! -f "$DIR/image.yaml" ] || [ ! -f "$APP_FILE" ]; then
+            echo "::notice::$SVC is not in $ENV_NAME yet ($DIR/image.yaml or $APP_FILE missing). Onboard it via its gitops PR; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          MODE=$( [ -f "$DIR/deploy.yaml" ] && yq '.mode // "auto"' "$DIR/deploy.yaml" || echo auto )
+          case "$MODE" in auto|approval) ;; *) echo "::error::$DIR/deploy.yaml: mode must be auto or approval, got '$MODE'"; exit 1;; esac
+          CUR_V=$(yq '.image.tag' "$DIR/image.yaml")
+          CUR_C=$(yq '.spec.sources[] | select(.chart) | .targetRevision' "$APP_FILE")
+          CMP=../.platform/scripts/semver-compare
+          # Anything that isn't SemVer yet (e.g. a commit SHA from before versioning) counts as older.
+          cmpv() { "$CMP" "$1" "$2" 2>/dev/null || echo 1; }
+          DV=$(cmpv "$VERSION" "$CUR_V"); DC=$(cmpv "$CHART_VERSION" "$CUR_C")
+          echo "mode=$MODE app: $CUR_V -> $VERSION ($DV)  chart: $CUR_C -> $CHART_VERSION ($DC)"
+          if [ "$DV" = -1 ] || [ "$DC" = -1 ]; then
+            echo "::notice::$ENV_NAME runs app $CUR_V / chart $CUR_C; $VERSION / $CHART_VERSION would go backwards. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$DV" = 0 ] && [ "$DC" = 0 ]; then
+            echo "::notice::$ENV_NAME already runs app $VERSION / chart $CHART_VERSION. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          { echo "mode=$MODE"; echo "cur_v=$CUR_V"; echo "cur_c=$CUR_C"; } >> "$GITHUB_OUTPUT"
+
+      - name: apply versions
+        if: steps.head.outputs.skip != 'true' && steps.state.outputs.skip != 'true'
+        id: apply
+        working-directory: gitops
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "msg=$ENV_NAME: $SVC $VERSION (chart $CHART_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: auto - commit on gitops main
+        if: steps.head.outputs.skip != 'true' && steps.state.outputs.skip != 'true' && steps.state.outputs.mode == 'auto'
+        working-directory: gitops
+        env:
+          MSG: ${{ steps.apply.outputs.msg }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase --quiet origin main
+            yq -i '.image.tag = strenv(VERSION)' "$DIR/image.yaml"
+            yq -i '(.spec.sources[] | select(.chart) | .targetRevision) = strenv(CHART_VERSION)' "$APP_FILE"
+            git add "$DIR/image.yaml" "$APP_FILE"
+            if git diff --cached --quiet; then echo "already deployed"; exit 0; fi
+            git commit -q -m "$MSG" -m "From ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+            if OUT=$(git push origin HEAD:main 2>&1); then echo "$OUT"; exit 0; fi
+            echo "$OUT"
+            if ! grep -qE 'rejected|fetch first|non-fast-forward' <<<"$OUT"; then
+              echo "::error::push to $GITOPS_REPO failed and it is not a race. Check that GITOPS_TOKEN has Contents: Read and write on $GITOPS_REPO."
+              exit 1
+            fi
+            echo "push raced with another commit, retrying ($attempt)"; git reset --hard --quiet origin/main; sleep $((attempt * 3))
+          done
+          exit 1
+
+      - name: approval - update the rolling deploy PR
+        if: steps.head.outputs.skip != 'true' && steps.state.outputs.skip != 'true' && steps.state.outputs.mode == 'approval'
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          CUR_V: ${{ steps.state.outputs.cur_v }}
+          CUR_C: ${{ steps.state.outputs.cur_c }}
+          MSG: ${{ steps.apply.outputs.msg }}
+        run: |
+          BRANCH="deploy/$ENV_NAME/$SVC"
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          # Rebuild the branch from main every time: exactly one change, never conflicts.
+          git switch -q -C "$BRANCH" origin/main
+          yq -i '.image.tag = strenv(VERSION)' "$DIR/image.yaml"
+          yq -i '(.spec.sources[] | select(.chart) | .targetRevision) = strenv(CHART_VERSION)' "$APP_FILE"
+          git commit -q -am "$MSG" -m "From $REPO_URL/commit/${{ github.sha }}"
+          if ! OUT=$(git push -q --force origin "$BRANCH" 2>&1); then
+            echo "$OUT"; echo "::error::could not push $BRANCH to $GITOPS_REPO. GITOPS_TOKEN needs Contents: Read and write."; exit 1
+          fi
+          BODY=$(printf '%s\n' \
+            "**Deploy \`$SVC\` to \`$ENV_NAME\`**" "" \
+            "| | now | after merge |" "|---|---|---|" \
+            "| app (image) | \`$CUR_V\` | \`$VERSION\` |" \
+            "| chart | \`$CUR_C\` | \`$CHART_VERSION\` |" "" \
+            "Built from \`${{ github.ref_name }}\` at [\`${GITHUB_SHA:0:7}\`]($REPO_URL/commit/${{ github.sha }}). [Commits on ${{ github.ref_name }}]($REPO_URL/commits/${{ github.ref_name }})" "" \
+            "Deploy mode is \`approval\` (\`$DIR/deploy.yaml\`): **merging this PR deploys it**; Argo CD syncs within ~3 minutes and runs the smoke tests." \
+            "CI keeps this PR on the newest build. To deploy a different version, use Backstage **Deploy service**.")
+          TITLE="Deploy $SVC $VERSION to $ENV_NAME"
+          PR=$(gh pr list -R "$GITOPS_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$PR" ]; then
+            gh pr edit "$PR" -R "$GITOPS_REPO" --title "$TITLE" --body "$BODY" >/dev/null && echo "updated PR #$PR"
+          elif ! gh pr create -R "$GITOPS_REPO" --base main --head "$BRANCH" --title "$TITLE" --body "$BODY"; then
+            echo "::error::could not open the deploy PR. For approval mode GITOPS_TOKEN also needs Pull requests: Read and write on $GITOPS_REPO."; exit 1
+          fi
